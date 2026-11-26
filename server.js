@@ -82,4 +82,37 @@ app.get("/api/me", auth, async (req, res) => {
   res.json(r.rows[0]);
 });
 
-app.listen(process.env.PORT || 3000, () => console.log("MindCare API running"));
+// Creates the tables automatically the first time the server starts
+async function initDb() {
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS users (
+      id SERIAL PRIMARY KEY,
+      display_name TEXT NOT NULL,
+      contact TEXT UNIQUE NOT NULL,
+      password_hash TEXT NOT NULL,
+      category TEXT NOT NULL CHECK (category IN ('student','mutuelle','hospital','workplace','other')),
+      language TEXT NOT NULL DEFAULT 'rw' CHECK (language IN ('rw','en')),
+      hospital_name TEXT,
+      patient_number TEXT,
+      hospital_verified BOOLEAN NOT NULL DEFAULT FALSE,
+      free_chat_used BOOLEAN NOT NULL DEFAULT FALSE,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+    CREATE TABLE IF NOT EXISTS intakes (
+      id SERIAL PRIMARY KEY,
+      user_id INT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      answers JSONB NOT NULL,
+      professional TEXT NOT NULL,
+      needs_doctor BOOLEAN NOT NULL,
+      urgent BOOLEAN NOT NULL,
+      status TEXT NOT NULL DEFAULT 'pending_review' CHECK (status IN ('pending_review','assigned','closed')),
+      assigned_to TEXT,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+  `);
+}
+
+initDb()
+  .then(() => app.listen(process.env.PORT || 3000, () => console.log("MindCare API running")))
+  .catch((e) => { console.error("Could not set up the database:", e.message); process.exit(1); });
+
