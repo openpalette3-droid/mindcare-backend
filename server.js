@@ -77,9 +77,51 @@ app.post("/api/login", async (req, res) => {
 
 app.get("/api/me", auth, async (req, res) => {
   const r = await db.query(
-    "SELECT id,display_name,category,language,hospital_name,hospital_verified,free_chat_used FROM users WHERE id=$1",
+    "SELECT id,display_name,contact,category,language,hospital_name,hospital_verified,free_chat_used FROM users WHERE id=$1",
     [req.user.id]);
-  res.json(r.rows[0]);
+  const u = r.rows[0];
+  if (!u) return res.status(404).json({ error: "Account not found." });
+  const i = await db.query(
+    "SELECT professional,needs_doctor,urgent,status,assigned_to,answers,created_at FROM intakes WHERE user_id=$1 ORDER BY created_at DESC LIMIT 1",
+    [u.id]);
+  res.json({ ...u, isClinical: clinicalList.includes(u.contact), intake: i.rows[0] || null });
+});
+
+// A logged-in client saves their quiz answers
+app.post("/api/intake", auth, async (req, res) => {
+  const a = req.body && req.body.answers;
+  if (!a || typeof a !== "object") return res.status(400).json({ error: "No answers received." });
+  const m = matchIntake(a);
+  await db.query(
+    "INSERT INTO intakes (user_id,answers,professional,needs_doctor,urgent) VALUES ($1,$2,$3,$4,$5)",
+    [req.user.id, a, m.professional, m.needsDoctor, m.urgent]);
+  res.status(201).json({ ok: true });
+});
+
+// ---- Clinical team only ----
+// Add the emails or phone numbers of your clinical team in Render, in CLINICAL_CONTACTS, separated by commas.
+const clinicalList = (process.env.CLINICAL_CONTACTS || "").split(",").map((x) => x.trim().toLowerCase()).filter(Boolean);
+async function clinicOnly(req, res, next) {
+  const r = await db.query("SELECT contact FROM users WHERE id=$1", [req.user.id]);
+  if (!r.rows[0] || !clinicalList.includes(r.rows[0].contact)) return res.status(403).json({ error: "Clinical team only." });
+  next();
+}
+
+app.get("/api/clinical/intakes", auth, clinicOnly, async (req, res) => {
+  const r = await db.query(
+    `SELECT i.id,i.answers,i.professional,i.needs_doctor,i.urgent,i.status,i.assigned_to,i.created_at,
+            u.display_name,u.contact,u.category,u.hospital_name,u.patient_number,u.hospital_verified,u.language
+     FROM intakes i JOIN users u ON u.id=i.user_id
+     ORDER BY (i.status='pending_review') DESC, i.urgent DESC, i.created_at DESC LIMIT 200`);
+  res.json(r.rows);
+});
+
+app.post("/api/clinical/intakes/:id", auth, clinicOnly, async (req, res) => {
+  const { status, assignedTo } = req.body;
+  if (!["pending_review", "assigned", "closed"].includes(status)) return res.status(400).json({ error: "Bad status." });
+  await db.query("UPDATE intakes SET status=$1, assigned_to=$2 WHERE id=$3",
+    [status, (assignedTo || "").slice(0, 120) || null, Number(req.params.id) || 0]);
+  res.json({ ok: true });
 });
 
 // Creates the tables automatically the first time the server starts
