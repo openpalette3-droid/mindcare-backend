@@ -27,25 +27,36 @@ const PRICES = {
   full: ["No insurance, individual session", 10000], group: ["Group session (up to 5 people)", 15000],
 };
 const PAY = ["momo", "card", "cash"];
+const DISC = ["student", "mutuelle_1", "mutuelle_2_3", "mutuelle_4", "other_insurance", "workplace"];
 const okProof = (p) => typeof p === "string" && /^data:(image\/(jpeg|png|webp)|application\/pdf);base64,/.test(p) && p.length < 2800000;
 
 // ---------- email ----------
-async function sendEmail(to, subject, text, attachments) {
+async function sendEmail(to, subject, text, attachments, html) {
   if (!to.length || !process.env.RESEND_API_KEY) { console.warn("Email not sent: email is not set up."); return; }
   try {
     const r = await fetch("https://api.resend.com/emails", {
       method: "POST",
       headers: { Authorization: "Bearer " + process.env.RESEND_API_KEY, "Content-Type": "application/json" },
-      body: JSON.stringify({ from: process.env.ALERT_FROM || "MindCare <onboarding@resend.dev>", to, subject, text, attachments }),
+      body: JSON.stringify({ from: process.env.ALERT_FROM || "MindCare <onboarding@resend.dev>", to, subject, text, attachments, html }),
     });
     if (!r.ok) console.error("Email failed:", r.status, await r.text());
   } catch (e) { console.error("Email failed:", e.message); }
 }
+const escH = (s) => String(s == null ? "" : s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+// Email look: "MindCare" as the title, with a subtitle such as "New booking"
+function htmlEmail(subtitle, rows, note, link) {
+  const tr = rows.map(([k, v]) => `<tr><td style="padding:8px 0;color:#6B8189;width:130px;vertical-align:top">${escH(k)}</td><td style="padding:8px 0;color:#3A5560"><b>${escH(v)}</b></td></tr>`).join("");
+  const btn = link ? `<p style="margin:18px 0 0"><a href="${escH(link)}" style="background:#3F7F7B;color:#ffffff;padding:12px 22px;border-radius:999px;text-decoration:none;font-weight:bold;display:inline-block">Open the clinical team page</a></p>` : "";
+  return `<div style="background:#f4f8f7;padding:24px;font-family:Arial,Helvetica,sans-serif"><div style="max-width:520px;margin:0 auto;background:#ffffff;border:1px solid #E1EBEA;border-radius:16px;overflow:hidden"><div style="padding:26px 28px 8px"><div style="font-family:Georgia,serif;font-size:32px;color:#2F6F6B;font-weight:bold">MindCare</div><div style="font-size:18px;color:#6B8189;margin-top:4px">${escH(subtitle)}</div></div><div style="padding:8px 28px 26px"><table style="width:100%;border-collapse:collapse;font-size:15px">${tr}</table>${btn}<p style="color:#6B8189;font-size:14px;line-height:1.5;margin:18px 0 0">${escH(note)}</p></div></div></div>`;
+}
+const PAYLBL = { momo: "MoMoPay", card: "Visa or Mastercard", cash: "Cash at a partner centre" };
 function alertClinicalTeam() {
   const to = (process.env.ALERT_EMAILS || "").split(",").map((x) => x.trim()).filter(Boolean);
-  return sendEmail(to, "MindCare: urgent request needs review today",
-    "A new urgent request is waiting.\n\nPlease log in and open the clinical team page:\n" + (process.env.FRONTEND_URL || "") +
-    "/clinic.html\n\nFor privacy, this email does not contain the client's name or answers.");
+  const link = (process.env.FRONTEND_URL || "") + "/clinic.html";
+  return sendEmail(to, "MindCare: Urgent request",
+    "MindCare - Urgent request\n\nA new urgent request is waiting. Please log in and open the clinical team page:\n" + link + "\n\nFor privacy, this email does not contain the client's name or answers.",
+    undefined,
+    htmlEmail("Urgent request", [["What", "A new urgent request needs review today"]], "For privacy, this email does not contain the client's name or answers.", link));
 }
 const icsDate = (d) => d.toISOString().replace(/[-:]/g, "").replace(/\.\d{3}/, "");
 function makeIcs(b, summary, desc) {
@@ -60,16 +71,16 @@ async function sendBookingEmails(b, t, u) {
   const k = new Date(new Date(b.starts_at).getTime() + 7200000).toISOString();
   const when = k.slice(0, 10) + " at " + k.slice(11, 16) + " (Kigali time)";
   const att = (summary, desc) => [{ filename: "mindcare-session.ics", content: Buffer.from(makeIcs(b, summary, desc)).toString("base64") }];
-  await sendEmail([t.email], "New booking: " + when,
-    "You have a new booking on MindCare.\n\nClient: " + u.display_name + " (" + u.contact + ")\nWhen: " + when +
-    "\nSession: " + b.price_label + "\nPayment method chosen: " + (b.payment || "none (free first chat)") +
-    "\n\nOpen the attached calendar file to add the session to your calendar with reminders (1 day and 1 hour before).",
-    att("MindCare session with " + u.display_name, "Session: " + b.price_label));
+  const note = "Open the attached calendar file to add the session to your calendar with reminders (1 day and 1 hour before).";
+  await sendEmail([t.email], "MindCare: New booking",
+    "MindCare - New booking\n\nClient: " + u.display_name + " (" + u.contact + ")\nWhen: " + when + "\nSession: " + b.price_label + "\nPayment: " + (PAYLBL[b.payment] || "none (free first chat)") + "\n\n" + note,
+    att("MindCare session with " + u.display_name, "Session: " + b.price_label),
+    htmlEmail("New booking", [["Client", u.display_name + " (" + u.contact + ")"], ["When", when], ["Session", b.price_label], ["Payment", PAYLBL[b.payment] || "None (free first chat)"]], note));
   if (String(u.contact).includes("@"))
-    await sendEmail([u.contact], "Your MindCare booking: " + when,
-      "Your booking is confirmed.\n\nTherapist: " + t.name + "\nWhen: " + when + "\nSession: " + b.price_label +
-      "\n\nOpen the attached calendar file to add the session to your calendar with reminders (1 day and 1 hour before).",
-      att("MindCare session with " + t.name, "Session: " + b.price_label));
+    await sendEmail([u.contact], "MindCare: Booking confirmed",
+      "MindCare - Booking confirmed\n\nTherapist: " + t.name + "\nWhen: " + when + "\nSession: " + b.price_label + "\n\n" + note,
+      att("MindCare session with " + t.name, "Session: " + b.price_label),
+      htmlEmail("Booking confirmed", [["Therapist", t.name], ["When", when], ["Session", b.price_label]], note));
 }
 
 // ---------- matching ----------
@@ -147,7 +158,7 @@ app.post("/api/login", wrap(async (req, res) => {
 }));
 
 app.get("/api/me", auth, wrap(async (req, res) => {
-  const r = await db.query("SELECT id,display_name,contact,category,language,hospital_name,hospital_verified,proof_status FROM users WHERE id=$1", [req.user.id]);
+  const r = await db.query("SELECT id,display_name,contact,category,language,hospital_name,hospital_verified,proof_status,approved_price FROM users WHERE id=$1", [req.user.id]);
   const u = r.rows[0];
   if (!u) return res.status(404).json({ error: "Account not found." });
   const i = await db.query(
@@ -201,10 +212,9 @@ app.post("/api/bookings", auth, wrap(async (req, res) => {
   } else {
     const p = PRICES[priceKey];
     if (!p || !PAY.includes(payment)) return res.status(400).json({ error: "Choose a session and a way to pay." });
-    const ur = (await db.query("SELECT category,proof_status FROM users WHERE id=$1", [req.user.id])).rows[0];
-    if (["student", "mutuelle_1", "mutuelle_2_3", "mutuelle_4", "other_insurance", "workplace"].includes(priceKey) &&
-        (ur.proof_status !== "approved" || (priceKey === "student" && ur.category !== "student")))
-      return res.status(400).json({ error: "That price needs approved proof (student card, insurance card or work proof). Choose another option, or wait until your card is approved." });
+    const ur = (await db.query("SELECT category,proof_status,approved_price FROM users WHERE id=$1", [req.user.id])).rows[0];
+    if (DISC.includes(priceKey) && (ur.proof_status !== "approved" || ur.approved_price !== priceKey))
+      return res.status(400).json({ error: "That price needs proof approved by our team. Choose the price you are approved for, or the full price." });
     label = p[0]; price = p[1]; pay = payment;
   }
   let b;
@@ -226,7 +236,7 @@ app.post("/api/bookings", auth, wrap(async (req, res) => {
 app.get("/api/clinical/intakes", auth, clinicOnly, wrap(async (req, res) => {
   const r = await db.query(
     `SELECT i.id,i.answers,i.professional,i.needs_doctor,i.urgent,i.status,i.therapist_id,t.name AS tname,
-            u.display_name,u.contact,u.category,u.hospital_name,u.patient_number,u.hospital_verified,u.id AS user_id,u.proof_status
+            u.display_name,u.contact,u.category,u.hospital_name,u.patient_number,u.hospital_verified,u.id AS user_id,u.proof_status,u.approved_price
      FROM intakes i JOIN users u ON u.id=i.user_id LEFT JOIN therapists t ON t.id=i.therapist_id
      ORDER BY (i.status<>'closed') DESC, i.urgent DESC, i.created_at DESC LIMIT 200`);
   res.json(r.rows);
@@ -261,8 +271,10 @@ app.get("/api/clinical/proof/:uid", auth, clinicOnly, wrap(async (req, res) => {
   res.json({ data: (r.rows[0] && r.rows[0].proof_data) || null });
 }));
 app.post("/api/clinical/proof/:uid", auth, clinicOnly, wrap(async (req, res) => {
-  if (!["approved", "rejected"].includes(req.body.status)) return res.status(400).json({ error: "Bad status." });
-  await db.query("UPDATE users SET proof_status=$1 WHERE id=$2", [req.body.status, Number(req.params.uid) || 0]);
+  const { status, priceKey } = req.body;
+  if (!["approved", "rejected"].includes(status)) return res.status(400).json({ error: "Bad status." });
+  if (status === "approved" && !DISC.includes(priceKey)) return res.status(400).json({ error: "Choose which price to approve." });
+  await db.query("UPDATE users SET proof_status=$1, approved_price=$3 WHERE id=$2", [status, Number(req.params.uid) || 0, status === "approved" ? priceKey : null]);
   res.json({ ok: true });
 }));
 
@@ -300,6 +312,8 @@ async function initDb() {
     CREATE UNIQUE INDEX IF NOT EXISTS bookings_slot ON bookings (therapist_id, starts_at) WHERE status<>'cancelled';
     ALTER TABLE users ADD COLUMN IF NOT EXISTS proof_data TEXT;
     ALTER TABLE users ADD COLUMN IF NOT EXISTS proof_status TEXT NOT NULL DEFAULT 'none';
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS approved_price TEXT;
+    UPDATE users SET approved_price = CASE category WHEN 'student' THEN 'student' WHEN 'mutuelle' THEN 'mutuelle_2_3' END WHERE proof_status='approved' AND approved_price IS NULL;
   `);
 }
 initDb()
