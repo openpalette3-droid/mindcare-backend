@@ -202,9 +202,9 @@ app.post("/api/bookings", auth, wrap(async (req, res) => {
     const p = PRICES[priceKey];
     if (!p || !PAY.includes(payment)) return res.status(400).json({ error: "Choose a session and a way to pay." });
     const ur = (await db.query("SELECT category,proof_status FROM users WHERE id=$1", [req.user.id])).rows[0];
-    if (["student", "mutuelle_1", "mutuelle_2_3", "mutuelle_4", "other_insurance"].includes(priceKey) &&
+    if (["student", "mutuelle_1", "mutuelle_2_3", "mutuelle_4", "other_insurance", "workplace"].includes(priceKey) &&
         (ur.proof_status !== "approved" || (priceKey === "student" && ur.category !== "student")))
-      return res.status(400).json({ error: "That price needs an approved student or insurance card. Choose another option, or wait until your card is approved." });
+      return res.status(400).json({ error: "That price needs approved proof (student card, insurance card or work proof). Choose another option, or wait until your card is approved." });
     label = p[0]; price = p[1]; pay = payment;
   }
   let b;
