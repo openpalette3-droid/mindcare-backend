@@ -3,8 +3,8 @@ const express = require("express"), cors = require("cors"), bcrypt = require("bc
 const { Pool } = require("pg");
 const db = new Pool({ connectionString: process.env.DATABASE_URL });
 const app = express();
-app.use(express.json());
 app.use(cors({ origin: process.env.FRONTEND_URL }));
+app.use(express.json({ limit: "4mb" }));
 
 const sign = (u) => jwt.sign({ id: u.id }, process.env.JWT_SECRET, { expiresIn: "7d" });
 const auth = (req, res, next) => {
@@ -27,6 +27,7 @@ const PRICES = {
   full: ["No insurance, individual session", 10000], group: ["Group session (up to 5 people)", 15000],
 };
 const PAY = ["momo", "card", "cash"];
+const okProof = (p) => typeof p === "string" && /^data:(image\/(jpeg|png|webp)|application\/pdf);base64,/.test(p) && p.length < 2800000;
 
 // ---------- email ----------
 async function sendEmail(to, subject, text, attachments) {
@@ -112,18 +113,22 @@ async function saveIntake(userId, a) {
 app.get("/api/pricing", (_, res) => res.json(PRICES));
 
 app.post("/api/signup", wrap(async (req, res) => {
-  const { name, contact, password, category, language, hospital, patientNumber, intake } = req.body;
+  const { name, contact, password, category, language, hospital, patientNumber, intake, proof } = req.body;
   if (!name || !contact || (password || "").length < 8 || !["student", "mutuelle", "hospital", "workplace", "other"].includes(category))
     return res.status(400).json({ error: "Enter a name or nickname, your email or phone, and a password of 8+ characters." });
   if (category === "hospital" && (!hospital || !patientNumber))
     return res.status(400).json({ error: "Enter your hospital and patient number." });
+  const needsProof = ["student", "mutuelle"].includes(category);
+  if (needsProof && !okProof(proof))
+    return res.status(400).json({ error: "Please upload a clear photo (JPG or PNG) or a PDF under 1.5 MB of your " + (category === "student" ? "student card." : "Mutuelle or insurance card.") });
   try {
     const hash = await bcrypt.hash(password, 12);
     const r = await db.query(
-      `INSERT INTO users (display_name,contact,password_hash,category,language,hospital_name,patient_number)
-       VALUES ($1,lower($2),$3,$4,$5,$6,$7) RETURNING id`,
+      `INSERT INTO users (display_name,contact,password_hash,category,language,hospital_name,patient_number,proof_data,proof_status)
+       VALUES ($1,lower($2),$3,$4,$5,$6,$7,$8,$9) RETURNING id`,
       [name, contact.trim(), hash, category, language === "en" ? "en" : "rw",
-       category === "hospital" ? hospital : null, category === "hospital" ? patientNumber : null]);
+       category === "hospital" ? hospital : null, category === "hospital" ? patientNumber : null,
+       needsProof ? proof : null, needsProof ? "pending" : "none"]);
     if (intake && intake.answers) { try { await saveIntake(r.rows[0].id, intake.answers); } catch (e) { console.error(e); } }
     res.status(201).json({ token: sign(r.rows[0]) });
   } catch (e) {
@@ -142,7 +147,7 @@ app.post("/api/login", wrap(async (req, res) => {
 }));
 
 app.get("/api/me", auth, wrap(async (req, res) => {
-  const r = await db.query("SELECT id,display_name,contact,category,language,hospital_name,hospital_verified FROM users WHERE id=$1", [req.user.id]);
+  const r = await db.query("SELECT id,display_name,contact,category,language,hospital_name,hospital_verified,proof_status FROM users WHERE id=$1", [req.user.id]);
   const u = r.rows[0];
   if (!u) return res.status(404).json({ error: "Account not found." });
   const i = await db.query(
@@ -161,6 +166,12 @@ app.post("/api/intake", auth, wrap(async (req, res) => {
   if (!a || typeof a !== "object") return res.status(400).json({ error: "No answers received." });
   await saveIntake(req.user.id, a);
   res.status(201).json({ ok: true });
+}));
+
+app.post("/api/proof", auth, wrap(async (req, res) => {
+  if (!okProof(req.body.proof)) return res.status(400).json({ error: "Please upload a clear photo (JPG or PNG) or a PDF under 1.5 MB." });
+  await db.query("UPDATE users SET proof_data=$1, proof_status='pending' WHERE id=$2", [req.body.proof, req.user.id]);
+  res.json({ ok: true });
 }));
 
 // ---------- booking ----------
@@ -190,6 +201,10 @@ app.post("/api/bookings", auth, wrap(async (req, res) => {
   } else {
     const p = PRICES[priceKey];
     if (!p || !PAY.includes(payment)) return res.status(400).json({ error: "Choose a session and a way to pay." });
+    const ur = (await db.query("SELECT category,proof_status FROM users WHERE id=$1", [req.user.id])).rows[0];
+    if (["student", "mutuelle_1", "mutuelle_2_3", "mutuelle_4", "other_insurance"].includes(priceKey) &&
+        (ur.proof_status !== "approved" || (priceKey === "student" && ur.category !== "student")))
+      return res.status(400).json({ error: "That price needs an approved student or insurance card. Choose another option, or wait until your card is approved." });
     label = p[0]; price = p[1]; pay = payment;
   }
   let b;
@@ -211,7 +226,7 @@ app.post("/api/bookings", auth, wrap(async (req, res) => {
 app.get("/api/clinical/intakes", auth, clinicOnly, wrap(async (req, res) => {
   const r = await db.query(
     `SELECT i.id,i.answers,i.professional,i.needs_doctor,i.urgent,i.status,i.therapist_id,t.name AS tname,
-            u.display_name,u.contact,u.category,u.hospital_name,u.patient_number,u.hospital_verified
+            u.display_name,u.contact,u.category,u.hospital_name,u.patient_number,u.hospital_verified,u.id AS user_id,u.proof_status
      FROM intakes i JOIN users u ON u.id=i.user_id LEFT JOIN therapists t ON t.id=i.therapist_id
      ORDER BY (i.status<>'closed') DESC, i.urgent DESC, i.created_at DESC LIMIT 200`);
   res.json(r.rows);
@@ -241,6 +256,22 @@ app.post("/api/clinical/therapists/:id/active", auth, clinicOnly, wrap(async (re
   res.json({ ok: true });
 }));
 
+app.get("/api/clinical/proof/:uid", auth, clinicOnly, wrap(async (req, res) => {
+  const r = await db.query("SELECT proof_data FROM users WHERE id=$1", [Number(req.params.uid) || 0]);
+  res.json({ data: (r.rows[0] && r.rows[0].proof_data) || null });
+}));
+app.post("/api/clinical/proof/:uid", auth, clinicOnly, wrap(async (req, res) => {
+  if (!["approved", "rejected"].includes(req.body.status)) return res.status(400).json({ error: "Bad status." });
+  await db.query("UPDATE users SET proof_status=$1 WHERE id=$2", [req.body.status, Number(req.params.uid) || 0]);
+  res.json({ ok: true });
+}));
+
+app.use((err, req, res, next) => {
+  if (err && err.type === "entity.too.large") return res.status(413).json({ error: "That file is too large. Please use a smaller photo or PDF." });
+  console.error(err);
+  res.status(400).json({ error: "Something was wrong with that request." });
+});
+
 async function initDb() {
   await db.query(`
     CREATE TABLE IF NOT EXISTS users (
@@ -267,6 +298,8 @@ async function initDb() {
       kind TEXT NOT NULL, price_label TEXT NOT NULL, price_rwf INT, payment TEXT,
       status TEXT NOT NULL DEFAULT 'confirmed', created_at TIMESTAMPTZ NOT NULL DEFAULT now());
     CREATE UNIQUE INDEX IF NOT EXISTS bookings_slot ON bookings (therapist_id, starts_at) WHERE status<>'cancelled';
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS proof_data TEXT;
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS proof_status TEXT NOT NULL DEFAULT 'none';
   `);
 }
 initDb()
